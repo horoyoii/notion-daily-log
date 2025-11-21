@@ -148,6 +148,16 @@ class NotionWorkLogCreator:
         if not block_type:
             return None
 
+        # child_page, child_database는 별도로 처리하므로 제외
+        if block_type in ['child_page', 'child_database']:
+            return None
+
+        # 복사할 수 없는 블록 타입들
+        unsupported_blocks = ['link_preview', 'unsupported']
+        if block_type in unsupported_blocks:
+            logger.warning(f"지원하지 않는 블록 타입: {block_type}")
+            return None
+
         # 기본 블록 구조
         cleaned_block = {
             'type': block_type,
@@ -156,6 +166,12 @@ class NotionWorkLogCreator:
 
         # 블록 타입별 데이터 복사
         original_content = block.get(block_type, {})
+
+        # 빈 블록 타입 (divider, breadcrumb, table_of_contents 등)
+        empty_block_types = ['divider', 'breadcrumb', 'table_of_contents']
+        if block_type in empty_block_types:
+            # 빈 객체만 필요
+            return cleaned_block
 
         # rich_text가 있는 경우 복사
         if 'rich_text' in original_content:
