@@ -199,65 +199,79 @@ class NotionWorkLogCreator:
         self.copy_blocks_to_page(target_block_id, child_blocks)
 
     def copy_blocks_to_page(self, target_page_id: str, blocks: list):
-        """블록들을 대상 페이지로 재귀적으로 복사"""
+        """블록들을 대상 페이지로 순서대로 복사 (일반 블록 + child_page 포함)"""
         if not blocks:
             logger.info("복사할 블록이 없습니다.")
             return
 
-        logger.info(f"블록 복사 시작: {len(blocks)}개")
-
-        url = f"{self.base_url}/blocks/{target_page_id}/children"
-
-        # 블록 데이터 정리
-        cleaned_blocks = []
-        original_blocks = []
+        import time
+        logger.info(f"블록 복사 시작: {len(blocks)}개 (순서 유지)")
 
         for block in blocks:
+            block_type = block.get('type')
+
+            # child_page는 별도로 처리
+            if block_type == 'child_page':
+                logger.info(f"하위 페이지 발견 (순서 유지): {block.get('child_page', {}).get('title', '제목 없음')}")
+                time.sleep(0.5)
+                try:
+                    self.copy_child_page(block['id'], target_page_id)
+                except Exception as e:
+                    logger.error(f"하위 페이지 복사 실패: {str(e)}")
+                    # 계속 진행
+                continue
+
+            # child_database도 별도 처리 (현재는 스킵)
+            if block_type == 'child_database':
+                logger.warning(f"child_database는 현재 지원하지 않습니다: {block['id']}")
+                continue
+
+            # 일반 블록 복사
             cleaned_block = self.clean_block_for_copy(block)
-            if cleaned_block:
-                cleaned_blocks.append(cleaned_block)
-                original_blocks.append(block)
+            if not cleaned_block:
+                continue
 
-        if not cleaned_blocks:
-            logger.info("복사할 유효한 블록이 없습니다.")
-            return
+            # 단일 블록 추가
+            url = f"{self.base_url}/blocks/{target_page_id}/children"
+            payload = {
+                "children": [cleaned_block]
+            }
 
-        # 블록 생성 요청
-        payload = {
-            "children": cleaned_blocks
-        }
+            try:
+                response = requests.patch(url, headers=self.headers, json=payload)
+                response.raise_for_status()
 
-        try:
-            response = requests.patch(url, headers=self.headers, json=payload)
-            response.raise_for_status()
+                result = response.json()
+                created_blocks = result.get('results', [])
 
-            result = response.json()
-            created_blocks = result.get('results', [])
+                if created_blocks:
+                    created_block = created_blocks[0]
+                    logger.info(f"블록 복사 완료: {block_type}")
 
-            logger.info(f"블록 복사 완료: {len(created_blocks)}개")
+                    # 자식 블록이 있는 경우 재귀적으로 복사
+                    if block.get('has_children'):
+                        original_block_id = block['id']
+                        created_block_id = created_block['id']
+                        logger.info(f"중첩 블록 복사 시작: {block_type}")
 
-            # 자식 블록이 있는 경우 재귀적으로 복사
-            for i, (original_block, created_block) in enumerate(zip(original_blocks, created_blocks)):
-                if original_block.get('has_children'):
-                    original_block_id = original_block['id']
-                    created_block_id = created_block['id']
-                    logger.info(f"중첩 블록 복사 시작: {original_block.get('type')}")
+                        time.sleep(0.3)
 
-                    # 약간의 지연 (API 제한 방지)
-                    import time
-                    time.sleep(0.3)
+                        try:
+                            self.copy_block_children(original_block_id, created_block_id)
+                        except Exception as e:
+                            logger.error(f"중첩 블록 복사 실패: {str(e)}")
+                            # 계속 진행
 
-                    try:
-                        self.copy_block_children(original_block_id, created_block_id)
-                    except Exception as e:
-                        logger.error(f"중첩 블록 복사 실패: {str(e)}")
-                        # 계속 진행
+                # API 속도 제한 방지
+                time.sleep(0.3)
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"블록 복사 실패: {str(e)}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"응답 내용: {e.response.text}")
-            logger.warning("블록 복사에 실패했지만 페이지는 생성되었습니다.")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"블록 복사 실패 ({block_type}): {str(e)}")
+                if hasattr(e.response, 'text'):
+                    logger.error(f"응답 내용: {e.response.text}")
+                # 계속 진행
+
+        logger.info(f"모든 블록 복사 완료")
 
     def get_child_pages(self, page_id: str) -> list:
         """페이지의 모든 하위 페이지 가져오기"""
@@ -382,7 +396,7 @@ class NotionWorkLogCreator:
             # 하위 페이지 복사 실패는 치명적이지 않으므로 계속 진행
 
     def duplicate_page(self, date_info: dict) -> str:
-        """템플릿 페이지 완전 복제 (블록 + 하위 페이지)"""
+        """템플릿 페이지 완전 복제 (블록 + 하위 페이지 순서 유지)"""
         import time
 
         logger.info(f"템플릿 페이지 복제 시작: {self.template_page_id}")
@@ -393,21 +407,11 @@ class NotionWorkLogCreator:
 
             time.sleep(0.5)
 
-            # 2. 템플릿 페이지의 블록 가져오기 및 복사
+            # 2. 템플릿 페이지의 블록 가져오기 및 순서대로 복사
+            # (child_page도 블록 리스트에 포함되어 있으므로 순서대로 처리됨)
             template_blocks = self.get_page_blocks(self.template_page_id)
             if template_blocks:
                 self.copy_blocks_to_page(new_page_id, template_blocks)
-
-            time.sleep(0.5)
-
-            # 3. 하위 페이지 복사
-            child_pages = self.get_child_pages(self.template_page_id)
-            if child_pages:
-                logger.info(f"하위 페이지 복사 시작: {len(child_pages)}개")
-                for child_page in child_pages:
-                    child_page_id = child_page['id']
-                    time.sleep(0.5)
-                    self.copy_child_page(child_page_id, new_page_id)
 
             logger.info(f"페이지 복제 완료: {new_page_id}")
             return new_page_id
