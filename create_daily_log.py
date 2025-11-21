@@ -65,35 +65,49 @@ class NotionWorkLogCreator:
             next_day += timedelta(days=1)
         return next_day
     
-    def duplicate_page(self) -> str:
-        """템플릿 페이지 복제 (하위 페이지 포함)"""
-        logger.info(f"템플릿 페이지 복제 시작: {self.template_page_id}")
-        
-        url = f"{self.base_url}/pages/{self.template_page_id}/duplicate"
-        
+    def get_page_blocks(self, page_id: str) -> list:
+        """페이지의 모든 블록 가져오기"""
+        logger.info(f"페이지 블록 조회: {page_id}")
+
+        url = f"{self.base_url}/blocks/{page_id}/children"
+        all_blocks = []
+
         try:
-            response = requests.post(url, headers=self.headers)
-            response.raise_for_status()
-            
-            result = response.json()
-            new_page_id = result['id']
-            
-            logger.info(f"페이지 복제 성공: {new_page_id}")
-            return new_page_id
-            
+            has_more = True
+            start_cursor = None
+
+            while has_more:
+                params = {}
+                if start_cursor:
+                    params['start_cursor'] = start_cursor
+
+                response = requests.get(url, headers=self.headers, params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                all_blocks.extend(data.get('results', []))
+                has_more = data.get('has_more', False)
+                start_cursor = data.get('next_cursor')
+
+            logger.info(f"블록 조회 완료: {len(all_blocks)}개")
+            return all_blocks
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"페이지 복제 실패: {str(e)}")
+            logger.error(f"블록 조회 실패: {str(e)}")
             if hasattr(e.response, 'text'):
                 logger.error(f"응답 내용: {e.response.text}")
             raise
-    
-    def update_page_properties(self, page_id: str, date_info: dict):
-        """페이지 속성 업데이트 (이름 및 작성일)"""
-        logger.info(f"페이지 속성 업데이트: {page_id}")
-        
-        url = f"{self.base_url}/pages/{page_id}"
-        
+
+    def create_page_in_database(self, date_info: dict) -> str:
+        """데이터베이스에 새 페이지 생성"""
+        logger.info(f"새 페이지 생성: {date_info['formatted_title']}")
+
+        url = f"{self.base_url}/pages"
+
         payload = {
+            "parent": {
+                "database_id": self.data_source_id
+            },
             "properties": {
                 "이름": {
                     "title": [
@@ -111,18 +125,279 @@ class NotionWorkLogCreator:
                 }
             }
         }
-        
+
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+
+            result = response.json()
+            new_page_id = result['id']
+
+            logger.info(f"페이지 생성 성공: {new_page_id}")
+            return new_page_id
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"페이지 생성 실패: {str(e)}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"응답 내용: {e.response.text}")
+            raise
+
+    def clean_block_for_copy(self, block: dict) -> dict:
+        """블록 데이터를 복사 가능한 형태로 정리"""
+        block_type = block.get('type')
+        if not block_type:
+            return None
+
+        # 기본 블록 구조
+        cleaned_block = {
+            'type': block_type,
+            block_type: {}
+        }
+
+        # 블록 타입별 데이터 복사
+        original_content = block.get(block_type, {})
+
+        # rich_text가 있는 경우 복사
+        if 'rich_text' in original_content:
+            cleaned_block[block_type]['rich_text'] = original_content['rich_text']
+
+        # 다른 속성들도 복사 (read-only 필드는 제외)
+        readonly_fields = ['id', 'created_time', 'last_edited_time', 'created_by', 'last_edited_by', 'has_children', 'archived', 'parent']
+        for key, value in original_content.items():
+            if key not in readonly_fields and key not in cleaned_block[block_type]:
+                cleaned_block[block_type][key] = value
+
+        return cleaned_block
+
+    def copy_block_children(self, source_block_id: str, target_block_id: str):
+        """블록의 자식 블록들을 재귀적으로 복사"""
+        logger.info(f"자식 블록 복사: {source_block_id} -> {target_block_id}")
+
+        # 자식 블록 가져오기
+        child_blocks = self.get_page_blocks(source_block_id)
+
+        if not child_blocks:
+            return
+
+        # 자식 블록들을 대상 블록에 추가
+        self.copy_blocks_to_page(target_block_id, child_blocks)
+
+    def copy_blocks_to_page(self, target_page_id: str, blocks: list):
+        """블록들을 대상 페이지로 재귀적으로 복사"""
+        if not blocks:
+            logger.info("복사할 블록이 없습니다.")
+            return
+
+        logger.info(f"블록 복사 시작: {len(blocks)}개")
+
+        url = f"{self.base_url}/blocks/{target_page_id}/children"
+
+        # 블록 데이터 정리
+        cleaned_blocks = []
+        original_blocks = []
+
+        for block in blocks:
+            cleaned_block = self.clean_block_for_copy(block)
+            if cleaned_block:
+                cleaned_blocks.append(cleaned_block)
+                original_blocks.append(block)
+
+        if not cleaned_blocks:
+            logger.info("복사할 유효한 블록이 없습니다.")
+            return
+
+        # 블록 생성 요청
+        payload = {
+            "children": cleaned_blocks
+        }
+
         try:
             response = requests.patch(url, headers=self.headers, json=payload)
             response.raise_for_status()
-            
-            logger.info(f"페이지 속성 업데이트 성공: {date_info['formatted_title']}")
-            return response.json()
-            
+
+            result = response.json()
+            created_blocks = result.get('results', [])
+
+            logger.info(f"블록 복사 완료: {len(created_blocks)}개")
+
+            # 자식 블록이 있는 경우 재귀적으로 복사
+            for i, (original_block, created_block) in enumerate(zip(original_blocks, created_blocks)):
+                if original_block.get('has_children'):
+                    original_block_id = original_block['id']
+                    created_block_id = created_block['id']
+                    logger.info(f"중첩 블록 복사 시작: {original_block.get('type')}")
+
+                    # 약간의 지연 (API 제한 방지)
+                    import time
+                    time.sleep(0.3)
+
+                    try:
+                        self.copy_block_children(original_block_id, created_block_id)
+                    except Exception as e:
+                        logger.error(f"중첩 블록 복사 실패: {str(e)}")
+                        # 계속 진행
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"페이지 속성 업데이트 실패: {str(e)}")
+            logger.error(f"블록 복사 실패: {str(e)}")
             if hasattr(e.response, 'text'):
                 logger.error(f"응답 내용: {e.response.text}")
+            logger.warning("블록 복사에 실패했지만 페이지는 생성되었습니다.")
+
+    def get_child_pages(self, page_id: str) -> list:
+        """페이지의 모든 하위 페이지 가져오기"""
+        logger.info(f"하위 페이지 조회: {page_id}")
+
+        url = f"{self.base_url}/blocks/{page_id}/children"
+        child_pages = []
+
+        try:
+            has_more = True
+            start_cursor = None
+
+            while has_more:
+                params = {}
+                if start_cursor:
+                    params['start_cursor'] = start_cursor
+
+                response = requests.get(url, headers=self.headers, params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                blocks = data.get('results', [])
+
+                # child_page 타입의 블록만 필터링
+                for block in blocks:
+                    if block.get('type') == 'child_page':
+                        child_pages.append(block)
+
+                has_more = data.get('has_more', False)
+                start_cursor = data.get('next_cursor')
+
+            logger.info(f"하위 페이지 조회 완료: {len(child_pages)}개")
+            return child_pages
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"하위 페이지 조회 실패: {str(e)}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"응답 내용: {e.response.text}")
+            return []
+
+    def create_child_page(self, parent_page_id: str, title: str) -> str:
+        """하위 페이지 생성"""
+        logger.info(f"하위 페이지 생성: {title}")
+
+        url = f"{self.base_url}/pages"
+
+        payload = {
+            "parent": {
+                "page_id": parent_page_id
+            },
+            "properties": {
+                "title": [
+                    {
+                        "text": {
+                            "content": title
+                        }
+                    }
+                ]
+            }
+        }
+
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+
+            result = response.json()
+            new_page_id = result['id']
+
+            logger.info(f"하위 페이지 생성 성공: {new_page_id}")
+            return new_page_id
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"하위 페이지 생성 실패: {str(e)}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"응답 내용: {e.response.text}")
+            raise
+
+    def copy_child_page(self, source_page_id: str, target_parent_id: str):
+        """하위 페이지를 재귀적으로 복사"""
+        import time
+
+        logger.info(f"하위 페이지 복사 시작: {source_page_id}")
+
+        try:
+            # 1. 원본 페이지 정보 가져오기
+            url = f"{self.base_url}/pages/{source_page_id}"
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+
+            source_page = response.json()
+
+            # 페이지 제목 추출
+            title_property = source_page.get('properties', {}).get('title', {})
+            title_array = title_property.get('title', [])
+            title = title_array[0].get('text', {}).get('content', '제목 없음') if title_array else '제목 없음'
+
+            # 2. 새 하위 페이지 생성
+            new_page_id = self.create_child_page(target_parent_id, title)
+
+            # 약간의 지연
+            time.sleep(0.5)
+
+            # 3. 원본 페이지의 블록 복사
+            source_blocks = self.get_page_blocks(source_page_id)
+            if source_blocks:
+                self.copy_blocks_to_page(new_page_id, source_blocks)
+
+            # 약간의 지연
+            time.sleep(0.5)
+
+            # 4. 하위 페이지의 하위 페이지들도 재귀적으로 복사
+            child_pages = self.get_child_pages(source_page_id)
+            for child_page in child_pages:
+                child_page_id = child_page['id']
+                time.sleep(0.5)
+                self.copy_child_page(child_page_id, new_page_id)
+
+            logger.info(f"하위 페이지 복사 완료: {title}")
+
+        except Exception as e:
+            logger.error(f"하위 페이지 복사 실패: {str(e)}")
+            # 하위 페이지 복사 실패는 치명적이지 않으므로 계속 진행
+
+    def duplicate_page(self, date_info: dict) -> str:
+        """템플릿 페이지 완전 복제 (블록 + 하위 페이지)"""
+        import time
+
+        logger.info(f"템플릿 페이지 복제 시작: {self.template_page_id}")
+
+        try:
+            # 1. 새 페이지 생성
+            new_page_id = self.create_page_in_database(date_info)
+
+            time.sleep(0.5)
+
+            # 2. 템플릿 페이지의 블록 가져오기 및 복사
+            template_blocks = self.get_page_blocks(self.template_page_id)
+            if template_blocks:
+                self.copy_blocks_to_page(new_page_id, template_blocks)
+
+            time.sleep(0.5)
+
+            # 3. 하위 페이지 복사
+            child_pages = self.get_child_pages(self.template_page_id)
+            if child_pages:
+                logger.info(f"하위 페이지 복사 시작: {len(child_pages)}개")
+                for child_page in child_pages:
+                    child_page_id = child_page['id']
+                    time.sleep(0.5)
+                    self.copy_child_page(child_page_id, new_page_id)
+
+            logger.info(f"페이지 복제 완료: {new_page_id}")
+            return new_page_id
+
+        except Exception as e:
+            logger.error(f"페이지 복제 실패: {str(e)}")
             raise
     
     def check_existing_log(self, date_info: dict) -> bool:
@@ -175,15 +450,12 @@ class NotionWorkLogCreator:
             logger.info("이미 존재하는 로그로 인해 생성을 건너뜁니다.")
             return
 
-        # 템플릿 페이지 복제 (하위 페이지 자동 포함)
-        new_page_id = self.duplicate_page()
+        # 템플릿 페이지 복제 (속성 포함하여 새 페이지 생성)
+        new_page_id = self.duplicate_page(date_info)
 
-        # 복제 완료까지 대기
-        logger.info("복제 완료 대기 중... (5초)")
-        time.sleep(5)
-
-        # 페이지 속성 업데이트
-        self.update_page_properties(new_page_id, date_info)
+        # 블록 복사 완료까지 대기
+        logger.info("페이지 생성 완료 대기 중... (2초)")
+        time.sleep(2)
 
         logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 완료 ===")
         logger.info(f"페이지 ID: {new_page_id}")
