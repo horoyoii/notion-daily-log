@@ -1,0 +1,40 @@
+name: Weekly Archive
+
+on:
+  schedule:
+    # 매주 월요일 오전 9시 (UTC 0시)에 실행
+    - cron: '0 0 * * 1'
+  workflow_dispatch: # 수동 실행 가능
+
+jobs:
+  archive-last-week:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install requests python-dotenv
+
+    - name: Archive last week's logs
+      env:
+        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        DATA_SOURCE_ID: ${{ secrets.DATA_SOURCE_ID }}
+        ARCHIVE_PAGE_ID: ${{ secrets.ARCHIVE_PAGE_ID }}
+      run: |
+        python archive_last_week.py
+
+    - name: Upload log file (if exists)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: archive-execution-log
+        path: archive_execution.log
+        retention-days: 30
