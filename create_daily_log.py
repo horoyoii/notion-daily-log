@@ -42,18 +42,28 @@ class NotionWorkLogCreator:
         if date is None:
             # 한국 시간 기준 (UTC+9)
             date = datetime.utcnow() + timedelta(hours=9)
-        
+
         weekday_names = ['월', '화', '수', '목', '금', '토', '일']
         weekday = weekday_names[date.weekday()]
-        
+        is_weekend = date.weekday() >= 5  # 5=토, 6=일
+
         return {
             'year': date.year,
             'month': date.month,
             'day': date.day,
             'weekday': weekday,
+            'is_weekend': is_weekend,
             'formatted_title': f"{date.year}년 {date.month}월 {date.day}일 ({weekday})",
             'iso_date': date.strftime('%Y-%m-%d')
         }
+
+    def get_next_business_day(self, date: datetime) -> datetime:
+        """다음 업무일 반환 (주말 건너뛰기)"""
+        next_day = date + timedelta(days=1)
+        # 토요일이면 월요일로, 일요일이면 월요일로
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        return next_day
     
     def duplicate_page(self) -> str:
         """템플릿 페이지 복제 (하위 페이지 포함)"""
@@ -147,33 +157,55 @@ class NotionWorkLogCreator:
             # 확인 실패시 안전하게 진행
             return False
     
+    def create_work_log(self, date: datetime):
+        """특정 날짜의 업무로그 생성"""
+        import time
+
+        date_info = self.get_korean_date_info(date)
+
+        # 주말인 경우 건너뛰기
+        if date_info['is_weekend']:
+            logger.info(f"{date_info['formatted_title']}은(는) 주말이므로 생성을 건너뜁니다.")
+            return
+
+        logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 시작 ===")
+
+        # 기존 로그 확인
+        if self.check_existing_log(date_info):
+            logger.info("이미 존재하는 로그로 인해 생성을 건너뜁니다.")
+            return
+
+        # 템플릿 페이지 복제 (하위 페이지 자동 포함)
+        new_page_id = self.duplicate_page()
+
+        # 복제 완료까지 대기
+        logger.info("복제 완료 대기 중... (5초)")
+        time.sleep(5)
+
+        # 페이지 속성 업데이트
+        self.update_page_properties(new_page_id, date_info)
+
+        logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 완료 ===")
+        logger.info(f"페이지 ID: {new_page_id}")
+        logger.info(f"URL: https://www.notion.so/{new_page_id.replace('-', '')}")
+
     def create_daily_log(self):
-        """일일 업무로그 생성"""
+        """일일 업무로그 생성 (당일 + 다음 업무일)"""
         try:
-            # 1. 날짜 정보 생성
-            date_info = self.get_korean_date_info()
-            logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 시작 ===")
-            
-            # 2. 기존 로그 확인
-            if self.check_existing_log(date_info):
-                logger.info("이미 존재하는 로그로 인해 생성을 건너뜁니다.")
-                return
-            
-            # 3. 템플릿 페이지 복제 (하위 페이지 자동 포함)
-            new_page_id = self.duplicate_page()
-            
-            # 복제 완료까지 대기
-            import time
-            logger.info("복제 완료 대기 중... (5초)")
-            time.sleep(5)
-            
-            # 4. 페이지 속성 업데이트
-            self.update_page_properties(new_page_id, date_info)
-            
-            logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 완료 ===")
-            logger.info(f"페이지 ID: {new_page_id}")
-            logger.info(f"URL: https://www.notion.so/{new_page_id.replace('-', '')}")
-            
+            # 한국 시간 기준 현재 날짜
+            today = datetime.utcnow() + timedelta(hours=9)
+
+            # 1. 당일 업무로그 생성
+            logger.info("===== 당일 업무로그 생성 =====")
+            self.create_work_log(today)
+
+            # 2. 다음 업무일 업무로그 생성
+            next_business_day = self.get_next_business_day(today)
+            logger.info("\n===== 다음 업무일 업무로그 생성 =====")
+            self.create_work_log(next_business_day)
+
+            logger.info("\n===== 모든 업무로그 생성 완료 =====")
+
         except Exception as e:
             logger.error(f"업무로그 생성 중 오류 발생: {str(e)}")
             raise
