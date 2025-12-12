@@ -2,8 +2,8 @@ name: Weekly Archive
 
 on:
   schedule:
-    # 매주 월요일 오전 9시 (UTC 0시)에 실행
-    - cron: '0 0 * * 1'
+    # 매주 금요일 20시 (한국시간) = UTC 11시에 실행
+    - cron: '0 11 * * 5'
   workflow_dispatch: # 수동 실행 가능
 
 jobs:
