@@ -183,7 +183,7 @@ class NotionArchiver:
                     params['start_cursor'] = start_cursor
                 
                 response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
+                response.raise_for_status()
                 
                 data = response.json()
                 all_blocks.extend(data.get('results', []))
