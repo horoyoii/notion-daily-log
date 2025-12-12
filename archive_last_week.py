@@ -10,7 +10,10 @@ import sys
 import requests
 import json
 import re
+import time
+import threading
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import Optional
 from dotenv import load_dotenv
@@ -30,10 +33,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class RateLimiter:
+    """API 요청 rate limit 관리"""
+    
+    def __init__(self, min_interval: float = 0.2):
+        """
+        Args:
+            min_interval: 요청 간 최소 간격 (초). 기본값 0.2초 = 초당 최대 5회
+        """
+        self.min_interval = min_interval
+        self.lock = threading.Lock()
+        self.last_request_time = {}
+        self.consecutive_successes = 0
+        self.adaptive_interval = min_interval
+    
+    def wait_if_needed(self, thread_id: str = 'default'):
+        """필요시 대기하여 rate limit 준수"""
+        with self.lock:
+            now = time.time()
+            if thread_id in self.last_request_time:
+                elapsed = now - self.last_request_time[thread_id]
+                if elapsed < self.adaptive_interval:
+                    sleep_time = self.adaptive_interval - elapsed
+                    time.sleep(sleep_time)
+            
+            self.last_request_time[thread_id] = time.time()
+    
+    def handle_rate_limit_error(self, response):
+        """429 에러 처리 및 exponential backoff"""
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 2))
+            logger.warning(f"Rate limit 초과. {retry_after}초 대기...")
+            time.sleep(retry_after)
+            # adaptive interval 증가
+            self.adaptive_interval = min(self.adaptive_interval * 1.5, 1.0)
+            return True
+        return False
+    
+    def record_success(self):
+        """성공적인 요청 기록 및 adaptive interval 조정"""
+        with self.lock:
+            self.consecutive_successes += 1
+            # 연속 성공 시 interval 점진적 감소 (최소값 유지)
+            if self.consecutive_successes > 10:
+                self.adaptive_interval = max(
+                    self.adaptive_interval * 0.95,
+                    self.min_interval
+                )
+                self.consecutive_successes = 0
+    
+    def record_failure(self):
+        """실패 기록 및 interval 증가"""
+        with self.lock:
+            self.consecutive_successes = 0
+            self.adaptive_interval = min(self.adaptive_interval * 1.2, 1.0)
+
+
 class NotionArchiver:
     """Notion 업무로그 아카이브"""
 
-    def __init__(self, api_key: str, database_id: str, archive_page_id: str):
+    def __init__(self, api_key: str, database_id: str, archive_page_id: str, rate_limiter: Optional[RateLimiter] = None):
         self.api_key = api_key
         self.database_id = database_id
         self.archive_page_id = archive_page_id
@@ -43,6 +102,7 @@ class NotionArchiver:
             "Content-Type": "application/json",
             "Notion-Version": "2022-06-28"
         }
+        self.rate_limiter = rate_limiter
 
     def get_pages_before_last_friday(self) -> list:
         """지난주 금요일 이전의 모든 페이지 조회"""
@@ -389,7 +449,10 @@ class NotionArchiver:
             if block_type == 'child_page':
                 child_title = block.get('child_page', {}).get('title', '제목 없음')
                 logger.info(f"  하위 페이지 발견 (순서 유지): {child_title}")
-                time.sleep(0.5)
+                if self.rate_limiter:
+                    self.rate_limiter.wait_if_needed()
+                else:
+                    time.sleep(0.2)
                 try:
                     self.copy_child_page_recursive(block['id'], target_page_id)
                 except Exception as e:
@@ -423,13 +486,20 @@ class NotionArchiver:
                     if block.get('has_children'):
                         original_block_id = block['id']
                         created_block_id = created_block['id']
-                        time.sleep(0.3)
+                        if self.rate_limiter:
+                            self.rate_limiter.wait_if_needed()
+                        else:
+                            time.sleep(0.1)
                         try:
                             self.copy_block_children(original_block_id, created_block_id)
                         except Exception as e:
                             logger.error(f"  중첩 블록 복사 실패: {str(e)}")
                 
-                time.sleep(0.3)
+                # 최소 대기 (필요시에만)
+                if self.rate_limiter:
+                    self.rate_limiter.wait_if_needed()
+                else:
+                    time.sleep(0.1)
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"  블록 복사 실패 ({block_type}): {str(e)}")
@@ -458,20 +528,29 @@ class NotionArchiver:
             if not new_page_id:
                 return
             
-            time.sleep(0.5)
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
+            else:
+                time.sleep(0.2)
             
             # 4. 원본 페이지의 블록 복사
             source_blocks = self.get_page_blocks(source_page_id)
             if source_blocks:
                 self.copy_blocks_to_page(new_page_id, source_blocks)
             
-            time.sleep(0.5)
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
+            else:
+                time.sleep(0.2)
             
             # 5. 하위 페이지의 하위 페이지들도 재귀적으로 복사
             child_pages = self.get_child_pages(source_page_id)
             for child_page in child_pages:
                 child_page_id = child_page['id']
-                time.sleep(0.5)
+                if self.rate_limiter:
+                    self.rate_limiter.wait_if_needed()
+                else:
+                    time.sleep(0.2)
                 self.copy_child_page_recursive(child_page_id, new_page_id)
             
             logger.info(f"    하위 페이지 복사 완료: {title}")
@@ -479,9 +558,12 @@ class NotionArchiver:
         except Exception as e:
             logger.error(f"    하위 페이지 복사 실패: {str(e)}")
 
-    def move_page(self, page_id: str, page_title: str) -> bool:
-        """페이지를 읽고, 새로 만들고, 복사한 뒤 원본을 삭제합니다. (하위 페이지 재귀 복제 포함)"""
-        import time
+    def move_page(self, page_id: str, page_title: str, thread_id: str = 'default') -> bool:
+        """페이지를 읽고, 새로 만들고, 복사한 뒤 원본을 삭제합니다.
+        하위 페이지는 copy_blocks_to_page에서 자동으로 재귀 복제됩니다."""
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed(thread_id)
+        
         logger.info(f"페이지 이동 시작: {page_title}")
 
         # 1. 원본 페이지의 콘텐츠를 가져옵니다.
@@ -493,24 +575,20 @@ class NotionArchiver:
         if not new_page_id:
             return False
 
-        time.sleep(0.5)
+        # 짧은 대기 (페이지 생성 안정화)
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed(thread_id)
+        else:
+            time.sleep(0.3)
 
         # 3. 새 페이지에 콘텐츠를 추가합니다. (순서 유지, 하위 페이지 포함)
+        # copy_blocks_to_page에서 이미 child_page 블록을 순서대로 복사하므로
+        # 별도로 하위 페이지를 다시 복사할 필요가 없습니다.
         if content_blocks:
             self.copy_blocks_to_page(new_page_id, content_blocks)
         logger.info(f"  ✅ 콘텐츠 복사 완료")
 
-        # 4. 하위 페이지도 재귀적으로 복사
-        child_pages = self.get_child_pages(page_id)
-        if child_pages:
-            logger.info(f"  📁 하위 페이지 {len(child_pages)}개 발견, 재귀 복제 시작")
-            for child_page in child_pages:
-                child_page_id = child_page['id']
-                time.sleep(0.5)
-                self.copy_child_page_recursive(child_page_id, new_page_id)
-            logger.info(f"  ✅ 하위 페이지 복제 완료")
-
-        # 5. 원본 페이지를 삭제합니다.
+        # 4. 원본 페이지를 삭제합니다.
         if not self.delete_page(page_id, page_title):
             logger.error(f"!! 원본 페이지({page_id}) 삭제 실패. 수동 확인이 필요합니다.")
             return False
@@ -518,8 +596,13 @@ class NotionArchiver:
         logger.info(f"✅ 이동 완료: {page_title}")
         return True
 
-    def archive_last_week(self):
-        """지난주 금요일 이전의 모든 페이지 아카이브"""
+    def archive_last_week(self, max_workers: int = 3, use_parallel: bool = True):
+        """지난주 금요일 이전의 모든 페이지 아카이브
+        
+        Args:
+            max_workers: 병렬 처리 시 최대 워커 수 (기본값: 3)
+            use_parallel: 병렬 처리 사용 여부 (기본값: True)
+        """
         logger.info("=" * 80)
         logger.info("지난주 금요일 이전 업무로그 아카이브 시작")
         logger.info("=" * 80)
@@ -535,22 +618,57 @@ class NotionArchiver:
 
         # 2. 페이지 이동
         logger.info(f"\n아카이브 페이지로 이동 시작:")
-        logger.info(f"대상: https://www.notion.so/{self.archive_page_id.replace('-', '')}\n")
+        logger.info(f"대상: https://www.notion.so/{self.archive_page_id.replace('-', '')}")
+        if use_parallel:
+            logger.info(f"병렬 처리 모드: 최대 {max_workers}개 워커\n")
+        else:
+            logger.info(f"순차 처리 모드\n")
 
         success_count = 0
         fail_count = 0
 
-        # 날짜 역순으로 이동 (최신이 위로 오도록)
+        # 날짜 역순으로 정렬 (최신이 위로 오도록)
         pages_sorted = sorted(pages, key=lambda x: x.get('date', ''), reverse=True)
-        for page in pages_sorted:
-            import time
-            time.sleep(1)  # API 속도 제한 방지
-
-            if self.move_page(page['id'], page['title']):
-                success_count += 1
-            else:
-                fail_count += 1
-                logger.error(f"🔥 전체 이동 실패: {page['title']}. 다음 페이지로 계속 진행합니다.")
+        
+        # Rate limiter 생성
+        rate_limiter = RateLimiter(min_interval=0.2)
+        self.rate_limiter = rate_limiter
+        
+        if use_parallel and len(pages_sorted) > 1:
+            # 병렬 처리
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 각 페이지에 대해 작업 제출
+                future_to_page = {
+                    executor.submit(
+                        self._move_page_with_error_handling,
+                        page['id'],
+                        page['title'],
+                        f"worker-{i % max_workers}"
+                    ): page
+                    for i, page in enumerate(pages_sorted)
+                }
+                
+                # 완료된 작업 처리
+                for future in as_completed(future_to_page):
+                    page = future_to_page[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            logger.error(f"🔥 전체 이동 실패: {page['title']}. 다음 페이지로 계속 진행합니다.")
+                    except Exception as e:
+                        fail_count += 1
+                        logger.error(f"🔥 예외 발생 ({page['title']}): {str(e)}")
+        else:
+            # 순차 처리 (기존 방식)
+            for page in pages_sorted:
+                if self._move_page_with_error_handling(page['id'], page['title']):
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    logger.error(f"🔥 전체 이동 실패: {page['title']}. 다음 페이지로 계속 진행합니다.")
 
         # 3. 결과 요약
         logger.info("\n" + "=" * 80)
@@ -559,6 +677,14 @@ class NotionArchiver:
         logger.info(f"성공: {success_count}개")
         logger.info(f"실패: {fail_count}개")
         logger.info(f"전체: {len(pages)}개")
+    
+    def _move_page_with_error_handling(self, page_id: str, page_title: str, thread_id: str = 'default') -> bool:
+        """에러 처리를 포함한 move_page 래퍼"""
+        try:
+            return self.move_page(page_id, page_title, thread_id)
+        except Exception as e:
+            logger.error(f"페이지 이동 중 예외 발생 ({page_title}): {str(e)}")
+            return False
 
 
 def main():
@@ -575,8 +701,12 @@ def main():
         sys.exit(1)
 
     # 아카이브 실행
+    # 환경변수로 병렬 처리 설정 확인 (기본값: True)
+    use_parallel = os.getenv('ARCHIVE_USE_PARALLEL', 'true').lower() == 'true'
+    max_workers = int(os.getenv('ARCHIVE_MAX_WORKERS', '3'))
+    
     archiver = NotionArchiver(api_key, database_id, archive_page_id)
-    archiver.archive_last_week()
+    archiver.archive_last_week(max_workers=max_workers, use_parallel=use_parallel)
 
 
 if __name__ == "__main__":
