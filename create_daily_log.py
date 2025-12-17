@@ -31,6 +31,7 @@ class NotionWorkLogCreator:
         self.template_page_id = template_page_id
         self.data_source_id = data_source_id
         self.base_url = "https://api.notion.com/v1"
+        self.today_label = "오늘"  # 상태 라벨
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -420,8 +421,8 @@ class NotionWorkLogCreator:
             logger.error(f"페이지 복제 실패: {str(e)}")
             raise
     
-    def check_existing_log(self, date_info: dict) -> bool:
-        """해당 날짜의 로그가 이미 존재하는지 확인"""
+    def check_existing_log(self, date_info: dict) -> str:
+        """해당 날짜의 로그가 이미 존재하는지 확인. 존재하면 Page ID 반환, 없으면 None 반환"""
         logger.info(f"기존 로그 확인: {date_info['formatted_title']}")
         
         url = f"{self.base_url}/databases/{self.data_source_id}/query"
@@ -442,17 +443,103 @@ class NotionWorkLogCreator:
             results = response.json().get('results', [])
             
             if results:
-                logger.warning(f"이미 존재하는 로그: {date_info['formatted_title']}")
-                return True
+                page_id = results[0]['id']
+                logger.warning(f"이미 존재하는 로그: {date_info['formatted_title']} ({page_id})")
+                return page_id
             
-            return False
+            return None
             
         except requests.exceptions.RequestException as e:
             logger.error(f"기존 로그 확인 실패: {str(e)}")
             # 확인 실패시 안전하게 진행
-            return False
+            return None
+
+    def get_status_property_type(self) -> str:
+        """'상태' 속성의 타입을 확인 (select 또는 status)"""
+        url = f"{self.base_url}/databases/{self.data_source_id}"
+        
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            data = response.json()
+            properties = data.get('properties', {})
+            status_property = properties.get('상태')
+            
+            if not status_property:
+                logger.error("'상태' 속성을 찾을 수 없습니다.")
+                return None
+            
+            prop_type = status_property.get('type')
+            logger.info(f"'상태' 속성 타입 확인: {prop_type}")
+            return prop_type
+            
+        except Exception as e:
+            logger.error(f"데이터베이스 스키마 조회 실패: {str(e)}")
+            return None
+
+    def update_today_label(self, target_page_id: str):
+        """'오늘' 라벨을 target_page_id로 이동"""
+        prop_type = self.get_status_property_type()
+        if not prop_type or prop_type not in ['select', 'status']:
+            logger.error(f"지원하지 않는 '상태' 속성 타입입니다: {prop_type}")
+            return
+
+        logger.info(f"'{self.today_label}' 라벨 업데이트 시작 (타입: {prop_type})")
+
+        # 1. 기존에 '오늘' 라벨이 있는 페이지 찾기
+        url = f"{self.base_url}/databases/{self.data_source_id}/query"
+        
+        filter_condition = {
+            "property": "상태",
+            prop_type: {
+                "equals": self.today_label
+            }
+        }
+        
+        payload = {
+            "filter": filter_condition
+        }
+
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            
+            results = response.json().get('results', [])
+            
+            # 2. 기존 페이지들에서 '오늘' 라벨 제거
+            for page in results:
+                if page['id'] == target_page_id:
+                    continue  # 이미 대상 페이지에 라벨이 있으면 패스
+                
+                logger.info(f"이전 '오늘' 라벨 제거: {page['id']}")
+                # 라벨 제거Payload
+                clear_payload = {"상태": {prop_type: None}}
+                self.update_page_property(page['id'], clear_payload)
+
+            # 3. 대상 페이지에 '오늘' 라벨 부여
+            logger.info(f"새로운 '오늘' 라벨 부여: {target_page_id}")
+            # 라벨 부여 Payload
+            set_payload = {"상태": {prop_type: {"name": self.today_label}}}
+            self.update_page_property(target_page_id, set_payload)
+
+        except Exception as e:
+            logger.error(f"라벨 업데이트 실패: {str(e)}")
+            # 라벨 업데이트 실패는 치명적이지 않음
+
+    def update_page_property(self, page_id: str, properties: dict):
+        """페이지 속성 업데이트"""
+        url = f"{self.base_url}/pages/{page_id}"
+        payload = {"properties": properties}
+
+        try:
+            response = requests.patch(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+        except Exception as e:
+            logger.error(f"페이지 속성 업데이트 실패 ({page_id}): {str(e)}")
+            raise e
     
-    def create_work_log(self, date: datetime):
+    def create_work_log(self, date: datetime, is_today: bool = False):
         """특정 날짜의 업무로그 생성"""
         import time
 
@@ -466,20 +553,26 @@ class NotionWorkLogCreator:
         logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 시작 ===")
 
         # 기존 로그 확인
-        if self.check_existing_log(date_info):
-            logger.info("이미 존재하는 로그로 인해 생성을 건너뜁니다.")
-            return
+        existing_page_id = self.check_existing_log(date_info)
+        target_page_id = existing_page_id
 
-        # 템플릿 페이지 복제 (속성 포함하여 새 페이지 생성)
-        new_page_id = self.duplicate_page(date_info)
+        if existing_page_id:
+            logger.info("이미 존재하는 로그입니다.")
+        else:
+            # 템플릿 페이지 복제 (속성 포함하여 새 페이지 생성)
+            target_page_id = self.duplicate_page(date_info)
 
-        # 블록 복사 완료까지 대기
-        logger.info("페이지 생성 완료 대기 중... (2초)")
-        time.sleep(2)
+            # 블록 복사 완료까지 대기
+            logger.info("페이지 생성 완료 대기 중... (2초)")
+            time.sleep(2)
+        
+        # 오늘 날짜인 경우 라벨 업데이트
+        if is_today and target_page_id:
+            self.update_today_label(target_page_id)
 
         logger.info(f"=== {date_info['formatted_title']} 업무로그 생성 완료 ===")
-        logger.info(f"페이지 ID: {new_page_id}")
-        logger.info(f"URL: https://www.notion.so/{new_page_id.replace('-', '')}")
+        logger.info(f"페이지 ID: {target_page_id}")
+        logger.info(f"URL: https://www.notion.so/{target_page_id.replace('-', '')}")
 
     def create_daily_log(self):
         """일일 업무로그 생성 (당일 + 다음 업무일)"""
@@ -489,7 +582,7 @@ class NotionWorkLogCreator:
 
             # 1. 당일 업무로그 생성
             logger.info("===== 당일 업무로그 생성 =====")
-            self.create_work_log(today)
+            self.create_work_log(today, is_today=True)
 
             # 2. 다음 업무일 업무로그 생성
             next_business_day = self.get_next_business_day(today)
