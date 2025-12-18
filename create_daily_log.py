@@ -574,9 +574,53 @@ class NotionWorkLogCreator:
         logger.info(f"페이지 ID: {target_page_id}")
         logger.info(f"URL: https://www.notion.so/{target_page_id.replace('-', '')}")
 
+    def find_template_page_by_title(self, title: str) -> str:
+        """제목으로 템플릿 페이지 검색"""
+        logger.info(f"템플릿 페이지 검색: {title}")
+        
+        url = f"{self.base_url}/databases/{self.data_source_id}/query"
+        
+        payload = {
+            "filter": {
+                "property": "이름",
+                "title": {
+                    "equals": title
+                }
+            }
+        }
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            
+            results = response.json().get('results', [])
+            
+            if results:
+                page_id = results[0]['id']
+                logger.info(f"템플릿 페이지 찾음: {title} ({page_id})")
+                return page_id
+            
+            logger.warning(f"템플릿 페이지를 찾을 수 없음: {title}")
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"템플릿 페이지 검색 실패: {str(e)}")
+            return None
+
     def create_daily_log(self):
         """일일 업무로그 생성 (당일 + 다음 업무일)"""
         try:
+            # 0. 템플릿 페이지 동적 확인
+            template_title = "2025년 월 일 ( ) 템플릿"
+            found_template_id = self.find_template_page_by_title(template_title)
+            
+            if found_template_id:
+                if found_template_id != self.template_page_id:
+                    logger.info(f"템플릿 ID 업데이트: {self.template_page_id} -> {found_template_id}")
+                    self.template_page_id = found_template_id
+            else:
+                logger.warning(f"이름으로 템플릿을 찾을 수 없어 설정된 ID를 사용합니다: {self.template_page_id}")
+
             # 한국 시간 기준 현재 날짜
             today = datetime.utcnow() + timedelta(hours=9)
 
