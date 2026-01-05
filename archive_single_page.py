@@ -387,7 +387,7 @@ def main():
         logger.error("페이지 ID 또는 제목을 지정해주세요.")
         logger.error("사용법:")
         logger.error("  python archive_single_page.py --page-id <page_id>")
-        logger.error("  python archive_single_page.py --page-title \"2025년 12월 15일 (월)\"")
+        logger.error("  python archive_single_page.py --page-title \"2026년 12월 15일 (월)\"")
         logger.error("  또는 환경변수 PAGE_ID 또는 PAGE_TITLE 설정")
         sys.exit(1)
     

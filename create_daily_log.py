@@ -611,7 +611,7 @@ class NotionWorkLogCreator:
         """일일 업무로그 생성 (당일 + 다음 업무일)"""
         try:
             # 0. 템플릿 페이지 동적 확인
-            template_title = "2025년 월 일 ( ) 템플릿"
+            template_title = "2026년 월 일 ( ) 템플릿"
             found_template_id = self.find_template_page_by_title(template_title)
             
             if found_template_id:
