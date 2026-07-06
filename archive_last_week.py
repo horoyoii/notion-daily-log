@@ -12,7 +12,7 @@ import json
 import re
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import Optional
@@ -31,6 +31,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+KST_OFFSET = timedelta(hours=9)
+
+
+class BlockCopyError(RuntimeError):
+    """Raised when Notion block copy leaves a page incomplete."""
 
 
 class RateLimiter:
@@ -104,10 +109,24 @@ class NotionArchiver:
         }
         self.rate_limiter = rate_limiter
 
+    def omit_none_values(self, value):
+        """Notion append payloads must omit null-only fields."""
+        if isinstance(value, dict):
+            return {
+                key: self.omit_none_values(item)
+                for key, item in value.items()
+                if item is not None
+            }
+
+        if isinstance(value, list):
+            return [self.omit_none_values(item) for item in value]
+
+        return value
+
     def get_pages_before_last_friday(self) -> list:
         """지난주 금요일 이전의 모든 페이지 조회"""
         # 한국 시간 기준 오늘
-        today = datetime.utcnow() + timedelta(hours=9)
+        today = datetime.now(timezone.utc) + KST_OFFSET
 
         # 지난주 금요일 계산
         days_since_friday = (today.weekday() - 4) % 7
@@ -254,7 +273,7 @@ class NotionArchiver:
             
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ 블록 콘텐츠 조회 실패 ({page_id}): {e}")
-            return []
+            raise
     
     def get_block_children(self, block_id: str) -> Optional[list]:
         """페이지의 모든 하위 블록을 가져옵니다. (하위 호환성 유지)"""
@@ -366,7 +385,7 @@ class NotionArchiver:
             if key not in readonly_fields and key not in cleaned_block[block_type]:
                 cleaned_block[block_type][key] = value
         
-        return cleaned_block
+        return self.omit_none_values(cleaned_block)
 
     def _clean_block_for_append(self, block: dict) -> dict:
         """API로 블록을 다시 보낼 때 필요한 키만 포함하는 새 객체를 만듭니다. (하위 호환성 유지)"""
@@ -425,7 +444,7 @@ class NotionArchiver:
             
         except requests.exceptions.RequestException as e:
             logger.error(f"하위 페이지 조회 실패: {str(e)}")
-            return []
+            raise
     
     def copy_block_children(self, source_block_id: str, target_block_id: str):
         """블록의 자식 블록들을 재귀적으로 복사"""
@@ -457,6 +476,7 @@ class NotionArchiver:
                     self.copy_child_page_recursive(block['id'], target_page_id)
                 except Exception as e:
                     logger.error(f"  하위 페이지 복사 실패: {str(e)}")
+                    raise BlockCopyError(f"하위 페이지 복사 실패: {child_title}") from e
                 continue
             
             # child_database는 스킵
@@ -494,6 +514,7 @@ class NotionArchiver:
                             self.copy_block_children(original_block_id, created_block_id)
                         except Exception as e:
                             logger.error(f"  중첩 블록 복사 실패: {str(e)}")
+                            raise BlockCopyError(f"중첩 블록 복사 실패: {block_type}") from e
                 
                 # 최소 대기 (필요시에만)
                 if self.rate_limiter:
@@ -503,6 +524,9 @@ class NotionArchiver:
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"  블록 복사 실패 ({block_type}): {str(e)}")
+                if hasattr(e.response, 'text'):
+                    logger.error(f"  응답 내용: {e.response.text}")
+                raise BlockCopyError(f"블록 복사 실패: {block_type}") from e
     
     def copy_child_page_recursive(self, source_page_id: str, target_parent_id: str):
         """하위 페이지를 재귀적으로 복사"""
@@ -557,6 +581,7 @@ class NotionArchiver:
             
         except Exception as e:
             logger.error(f"    하위 페이지 복사 실패: {str(e)}")
+            raise
 
     def move_page(self, page_id: str, page_title: str, thread_id: str = 'default') -> bool:
         """페이지를 읽고, 새로 만들고, 복사한 뒤 원본을 삭제합니다.

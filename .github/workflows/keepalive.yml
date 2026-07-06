@@ -1,0 +1,27 @@
+name: Keepalive
+
+# GitHub는 저장소에 60일간 커밋 활동이 없으면 schedule 트리거 워크플로를 자동 비활성화한다
+# (state: disabled_inactivity). 이 워크플로가 주기적으로 빈 커밋을 밀어 타이머를 초기화해
+# daily-log / weekly-archive 스케줄이 꺼지지 않도록 유지한다.
+on:
+  schedule:
+    # 매주 월요일 06:00 UTC (한국시간 15:00)
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Push empty keepalive commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (prevent schedule auto-disable)"
+          git push

@@ -8,8 +8,13 @@ import os
 import sys
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 # 로깅 설정
 logging.basicConfig(
@@ -21,6 +26,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+KST_OFFSET = timedelta(hours=9)
+
+
+class BlockCopyError(RuntimeError):
+    """Raised when Notion block copy leaves a page incomplete."""
 
 
 class NotionWorkLogCreator:
@@ -37,12 +47,26 @@ class NotionWorkLogCreator:
             "Content-Type": "application/json",
             "Notion-Version": "2022-06-28"
         }
+
+    def omit_none_values(self, value):
+        """Notion append payloads must omit null-only fields."""
+        if isinstance(value, dict):
+            return {
+                key: self.omit_none_values(item)
+                for key, item in value.items()
+                if item is not None
+            }
+
+        if isinstance(value, list):
+            return [self.omit_none_values(item) for item in value]
+
+        return value
     
     def get_korean_date_info(self, date: datetime = None) -> dict:
         """한국 날짜 정보 반환"""
         if date is None:
             # 한국 시간 기준 (UTC+9)
-            date = datetime.utcnow() + timedelta(hours=9)
+            date = datetime.now(timezone.utc) + KST_OFFSET
 
         weekday_names = ['월', '화', '수', '목', '금', '토', '일']
         weekday = weekday_names[date.weekday()]
@@ -184,7 +208,7 @@ class NotionWorkLogCreator:
             if key not in readonly_fields and key not in cleaned_block[block_type]:
                 cleaned_block[block_type][key] = value
 
-        return cleaned_block
+        return self.omit_none_values(cleaned_block)
 
     def copy_block_children(self, source_block_id: str, target_block_id: str):
         """블록의 자식 블록들을 재귀적으로 복사"""
@@ -219,7 +243,7 @@ class NotionWorkLogCreator:
                     self.copy_child_page(block['id'], target_page_id)
                 except Exception as e:
                     logger.error(f"하위 페이지 복사 실패: {str(e)}")
-                    # 계속 진행
+                    raise BlockCopyError(f"하위 페이지 복사 실패: {block_type}") from e
                 continue
 
             # child_database도 별도 처리 (현재는 스킵)
@@ -261,7 +285,7 @@ class NotionWorkLogCreator:
                             self.copy_block_children(original_block_id, created_block_id)
                         except Exception as e:
                             logger.error(f"중첩 블록 복사 실패: {str(e)}")
-                            # 계속 진행
+                            raise BlockCopyError(f"중첩 블록 복사 실패: {block_type}") from e
 
                 # API 속도 제한 방지
                 time.sleep(0.3)
@@ -270,7 +294,7 @@ class NotionWorkLogCreator:
                 logger.error(f"블록 복사 실패 ({block_type}): {str(e)}")
                 if hasattr(e.response, 'text'):
                     logger.error(f"응답 내용: {e.response.text}")
-                # 계속 진행
+                raise BlockCopyError(f"블록 복사 실패: {block_type}") from e
 
         logger.info(f"모든 블록 복사 완료")
 
@@ -394,13 +418,14 @@ class NotionWorkLogCreator:
 
         except Exception as e:
             logger.error(f"하위 페이지 복사 실패: {str(e)}")
-            # 하위 페이지 복사 실패는 치명적이지 않으므로 계속 진행
+            raise
 
     def duplicate_page(self, date_info: dict) -> str:
         """템플릿 페이지 완전 복제 (블록 + 하위 페이지 순서 유지)"""
         import time
 
         logger.info(f"템플릿 페이지 복제 시작: {self.template_page_id}")
+        new_page_id = None
 
         try:
             # 1. 새 페이지 생성
@@ -419,7 +444,23 @@ class NotionWorkLogCreator:
 
         except Exception as e:
             logger.error(f"페이지 복제 실패: {str(e)}")
+            if new_page_id:
+                self.archive_incomplete_page(new_page_id, date_info['formatted_title'])
             raise
+
+    def archive_incomplete_page(self, page_id: str, title: str):
+        """복제 실패로 생긴 partial page를 보관 처리해 다음 실행을 막지 않게 한다."""
+        url = f"{self.base_url}/pages/{page_id}"
+        payload = {"archived": True}
+
+        try:
+            response = requests.patch(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            logger.info(f"불완전한 페이지 보관 완료: {title} ({page_id})")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"불완전한 페이지 보관 실패 ({page_id}): {str(e)}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"응답 내용: {e.response.text}")
     
     def check_existing_log(self, date_info: dict) -> str:
         """해당 날짜의 로그가 이미 존재하는지 확인. 존재하면 Page ID 반환, 없으면 None 반환"""
@@ -622,7 +663,7 @@ class NotionWorkLogCreator:
                 logger.warning(f"이름으로 템플릿을 찾을 수 없어 설정된 ID를 사용합니다: {self.template_page_id}")
 
             # 한국 시간 기준 현재 날짜
-            today = datetime.utcnow() + timedelta(hours=9)
+            today = datetime.now(timezone.utc) + KST_OFFSET
 
             # 1. 당일 업무로그 생성
             logger.info("===== 당일 업무로그 생성 =====")
@@ -642,6 +683,9 @@ class NotionWorkLogCreator:
 
 def main():
     """메인 함수"""
+    if load_dotenv:
+        load_dotenv()
+
     # 환경변수에서 설정 로드
     api_key = os.getenv('NOTION_API_KEY')
     template_page_id = os.getenv('TEMPLATE_PAGE_ID')

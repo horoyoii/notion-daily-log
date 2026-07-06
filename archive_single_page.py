@@ -27,6 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class BlockCopyError(RuntimeError):
+    """Raised when Notion block copy leaves a page incomplete."""
+
+
 class NotionSinglePageArchiver:
     """Notion 단일 페이지 아카이브"""
 
@@ -40,6 +44,20 @@ class NotionSinglePageArchiver:
             "Content-Type": "application/json",
             "Notion-Version": "2022-06-28"
         }
+
+    def omit_none_values(self, value):
+        """Notion append payloads must omit null-only fields."""
+        if isinstance(value, dict):
+            return {
+                key: self.omit_none_values(item)
+                for key, item in value.items()
+                if item is not None
+            }
+
+        if isinstance(value, list):
+            return [self.omit_none_values(item) for item in value]
+
+        return value
 
     def get_page_blocks(self, page_id: str) -> list:
         """페이지의 모든 블록 가져오기 (페이지네이션 처리)"""
@@ -67,7 +85,7 @@ class NotionSinglePageArchiver:
             
         except requests.exceptions.RequestException as e:
             logger.error(f"블록 콘텐츠 조회 실패 ({page_id}): {e}")
-            return []
+            raise
 
     def get_child_pages(self, page_id: str) -> list:
         """페이지의 모든 하위 페이지 가져오기"""
@@ -100,7 +118,7 @@ class NotionSinglePageArchiver:
             
         except requests.exceptions.RequestException as e:
             logger.error(f"하위 페이지 조회 실패: {str(e)}")
-            return []
+            raise
 
     def create_page(self, parent_id: str, title: str) -> Optional[str]:
         """지정된 부모 아래에 새 페이지를 만듭니다."""
@@ -158,7 +176,7 @@ class NotionSinglePageArchiver:
             if key not in readonly_fields and key not in cleaned_block[block_type]:
                 cleaned_block[block_type][key] = value
         
-        return cleaned_block
+        return self.omit_none_values(cleaned_block)
 
     def copy_block_children(self, source_block_id: str, target_block_id: str):
         """블록의 자식 블록들을 재귀적으로 복사"""
@@ -186,6 +204,7 @@ class NotionSinglePageArchiver:
                     self.copy_child_page_recursive(block['id'], target_page_id)
                 except Exception as e:
                     logger.error(f"  하위 페이지 복사 실패: {str(e)}")
+                    raise BlockCopyError(f"하위 페이지 복사 실패: {child_title}") from e
                 continue
             
             if block_type == 'child_database':
@@ -217,11 +236,15 @@ class NotionSinglePageArchiver:
                             self.copy_block_children(original_block_id, created_block_id)
                         except Exception as e:
                             logger.error(f"  중첩 블록 복사 실패: {str(e)}")
+                            raise BlockCopyError(f"중첩 블록 복사 실패: {block_type}") from e
                 
                 time.sleep(0.3)
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"  블록 복사 실패 ({block_type}): {str(e)}")
+                if hasattr(e.response, 'text'):
+                    logger.error(f"  응답 내용: {e.response.text}")
+                raise BlockCopyError(f"블록 복사 실패: {block_type}") from e
 
     def copy_child_page_recursive(self, source_page_id: str, target_parent_id: str):
         """하위 페이지를 재귀적으로 복사"""
@@ -262,6 +285,7 @@ class NotionSinglePageArchiver:
             
         except Exception as e:
             logger.error(f"    하위 페이지 복사 실패: {str(e)}")
+            raise
 
     def find_page_by_id(self, page_id: str) -> Optional[dict]:
         """페이지 ID로 페이지 찾기"""
@@ -340,17 +364,7 @@ class NotionSinglePageArchiver:
             self.copy_blocks_to_page(new_page_id, content_blocks)
         logger.info(f"  ✅ 콘텐츠 복사 완료")
 
-        # 4. 하위 페이지도 재귀적으로 복사
-        child_pages = self.get_child_pages(page_id)
-        if child_pages:
-            logger.info(f"  📁 하위 페이지 {len(child_pages)}개 발견, 재귀 복제 시작")
-            for child_page in child_pages:
-                child_page_id = child_page['id']
-                time.sleep(0.5)
-                self.copy_child_page_recursive(child_page_id, new_page_id)
-            logger.info(f"  ✅ 하위 페이지 복제 완료")
-
-        # 5. 원본 페이지 삭제
+        # 4. 원본 페이지 삭제
         if not self.delete_page(page_id, page_title):
             logger.error(f"원본 페이지({page_id}) 삭제 실패. 수동 확인이 필요합니다.")
             return False
@@ -439,4 +453,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

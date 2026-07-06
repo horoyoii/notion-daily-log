@@ -5,7 +5,7 @@
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import requests
 
@@ -26,7 +26,7 @@ print("📅 아카이브 기능 테스트")
 print("=" * 80)
 
 # 1. 지난주 날짜 계산
-today = datetime.utcnow() + timedelta(hours=9)
+today = datetime.now(timezone.utc) + timedelta(hours=9)
 print(f"\n오늘: {today.strftime('%Y년 %m월 %d일 (%a)')}")
 
 days_since_monday = today.weekday()

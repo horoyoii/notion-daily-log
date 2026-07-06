@@ -6,10 +6,16 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch: # 수동 실행 가능
 
+# 스케줄과 수동 실행이 겹쳐 같은 날짜를 중복 생성하지 않도록 직렬화
+concurrency:
+  group: daily-log
+  cancel-in-progress: false
+
 jobs:
   create-daily-log:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
